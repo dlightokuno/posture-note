@@ -58,6 +58,10 @@ canvas.photo{width:100%;display:block;touch-action:none;border-radius:8px;backgr
 svg text{fill:var(--sub);font-size:11px}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:start}
 @media (max-width:560px){.grid2{grid-template-columns:1fr}}
+.stab{height:6px;border-radius:3px;background:var(--line);margin:8px auto 6px;max-width:260px;overflow:hidden}
+.stab div{height:100%;width:0;background:var(--acc);transition:width .08s}
+.auto{display:flex;justify-content:center;align-items:center;gap:6px;font-size:14px;margin-top:6px}
+.auto input{width:20px;height:20px}
 .empty{color:var(--sub);text-align:center;padding:24px 0;font-size:14px}
 </style>
 </head>
@@ -84,7 +88,9 @@ svg text{fill:var(--sub);font-size:11px}
   <div class="card">
     <h2>センサー</h2>
     <div class="live" id="sLive">--.-°</div>
+    <div class="stab"><div id="sBar"></div></div>
     <div class="hint" id="sStatus" style="text-align:center">「センサー開始」を押してください</div>
+    <label class="auto"><input type="checkbox" id="sAuto" checked> 自動記録（当てて静止すると記録）</label>
     <div class="row" style="justify-content:center;margin-top:10px">
       <button id="sStart" class="pri">センサー開始</button>
       <button id="sCal">校正（0°合わせ）</button>
@@ -93,9 +99,9 @@ svg text{fill:var(--sub);font-size:11px}
     <details class="hint" style="margin-top:10px"><summary>使い方</summary>
       <ol style="padding-left:18px;margin:6px 0">
         <li>「センサー開始」→ 壁などの垂直面にスマホの背面を当てて「校正」。</li>
-        <li>スマホを縦向きにし、上端を頭側に向けて背面を棘突起に沿って当てます。</li>
+        <li>スマホを縦向きにし、上端を頭側に向けて背面を当てます。<b>棘突起の上に乗せるのではなく、背骨の中心に合わせて左右の筋肉にまたがるように</b>当て、指2本で両端を軽く押さえると安定します。</li>
         <li>上端をお腹側（前）に倒したときに＋になるか確認します（前額面の場合は右に倒して＋）。逆なら「＋−反転」を押します。</li>
-        <li>触診した各レベルに当てて「記録」。順番に次の点へ進みます。</li>
+        <li>自動記録がオンなら、各レベルに当てて約1秒静止すると「ピッ」と鳴って記録され、次の点へ進みます。離して次のレベルへ動かせばまた記録できます。オフのときは「記録」ボタンで記録します（押した瞬間の揺れは除いて平均します）。</li>
         <li>直立と前屈など、条件を揃えて保存すると比較できます。</li>
       </ol>
       ※医療機器ではありません。指導用の目安としてお使いください。
@@ -353,7 +359,7 @@ $('#sLevels').onclick = e => {
     const v = prompt(`${sp.levels[i]} の角度（°）`, sp.vals[i] ?? '');
     if (v !== null) sp.vals[i] = v === '' || isNaN(+v) ? null : +v;
   }
-  sp.cur = i; renderSpine();
+  sp.cur = i; au.armed = true; renderSpine();
 };
 $('#sPreset').onchange = () => {
   if (sp.vals.some(v => v != null) && !confirm('記録中の値はクリアされます。よろしいですか？')) { $('#sPreset').value = Object.keys(PRESETS).find(k => PRESETS[k] === sp.levels); return; }
@@ -380,29 +386,64 @@ $('#sSample').onclick = () => {
 const sen = { g: null, buf: [], cal: ls.get('cal', { os: 0, of: 0, sy: 0, sz: 1, sx: 1 }), got: false };
 const norm = a => ((a + 540) % 360) - 180;
 function rawAngles(g) {
-  const sy = sen.cal.sy || (g.y >= 0 ? 1 : -1);
-  return { s: Math.atan2(g.z * sen.cal.sz, g.y * sy) * D, f: Math.atan2(g.x * sen.cal.sx, g.y * sy) * D };
+  const sy = sen.cal.sy || (g.y >= 0 ? 1 : -1), n = Math.hypot(g.x, g.y, g.z) || 1;
+  // 前後：長軸（y）の傾き。左右の転がり（x/z間の移動）に影響されない
+  const s = Math.sign(g.z * sen.cal.sz || 1) * Math.atan2(Math.hypot(g.x, g.z), g.y * sy) * D;
+  // 左右：横軸（x）の傾き。前後の傾きに影響されない
+  const f = Math.asin(Math.max(-1, Math.min(1, g.x * sen.cal.sx / n))) * D;
+  return { s, f };
 }
 function onMotion(e) {
   const a = e.accelerationIncludingGravity; if (!a || a.x == null) return;
   sen.got = true;
-  const k = .35;
+  const k = .3;
   sen.g = sen.g ? { x: sen.g.x + (a.x - sen.g.x) * k, y: sen.g.y + (a.y - sen.g.y) * k, z: sen.g.z + (a.z - sen.g.z) * k } : { x: a.x, y: a.y, z: a.z };
   const r = rawAngles(sen.g), now = performance.now();
   sen.buf.push({ t: now, s: norm(r.s - sen.cal.os), f: norm(r.f - sen.cal.of) });
-  while (sen.buf.length && now - sen.buf[0].t > 600) sen.buf.shift();
+  while (sen.buf.length && now - sen.buf[0].t > 1600) sen.buf.shift();
 }
-function current() {
+// 直近 ms ミリ秒の平均とばらつき（データが窓を満たしていなければ full=false）
+function current(ms = 500) {
   const key = spPlane() === 'sag' ? 's' : 'f';
-  const now = performance.now(), b = sen.buf.filter(o => now - o.t < 500).map(o => o[key]);
-  if (!b.length) return null;
+  const now = performance.now(), w = sen.buf.filter(o => now - o.t < ms);
+  if (!w.length) return null;
+  const b = w.map(o => o[key]);
   const m = b.reduce((x, y) => x + y, 0) / b.length;
   const sd = Math.sqrt(b.reduce((x, y) => x + (y - m) ** 2, 0) / b.length);
-  return { v: m, sd };
+  return { v: m, sd, full: sen.buf[0].t <= now - ms * .9 };
 }
+function recordValue(c) {
+  sp.vals[sp.cur] = Math.round(c.v * 10) / 10; beep();
+  if (c.sd > .8) toast('ブレがあります。必要なら再記録してください');
+  au.armed = false; au.last = c.v; au.since = 0;
+  const nx = sp.vals.findIndex((v, i) => i > sp.cur && v == null);
+  sp.cur = nx >= 0 ? nx : Math.min(sp.cur + 1, sp.levels.length - 1);
+  renderSpine();
+}
+// 自動記録：動かす → 静止1.2秒 → 記録
+const au = { armed: false, last: null, since: 0 };
+const HOLD = 1200;
 let lastLive = 0;
 (function loop(t) {
-  if (t - lastLive > 80) { lastLive = t; const c = current(); if (c) $('#sLive').textContent = (c.v >= 0 ? '+' : '') + c.v.toFixed(1) + '°'; }
+  if (t - lastLive > 80 && sen.got) {
+    lastLive = t;
+    const c = current(500);
+    if (c) {
+      $('#sLive').textContent = (c.v >= 0 ? '+' : '') + c.v.toFixed(1) + '°';
+      const stable = c.full && c.sd < .3;
+      au.since = stable ? (au.since || t) : 0;
+      if (c.sd > 1 || (au.last != null && Math.abs(c.v - au.last) > 3)) au.armed = true;
+      const allDone = sp.vals.every(v => v != null);
+      const auto = $('#sAuto').checked && !allDone;
+      const prog = auto && au.armed && au.since ? Math.min(1, (t - au.since) / HOLD) : 0;
+      $('#sBar').style.width = (auto ? prog : (stable ? 1 : 0)) * 100 + '%';
+      $('#sStatus').textContent = allDone ? '全ての点を記録しました' :
+        !$('#sAuto').checked ? (stable ? `安定（ばらつき ±${c.sd.toFixed(1)}°）` : '静止させてください') :
+        !au.armed ? `記録済み。次の ${sp.levels[sp.cur]} へ動かしてください` :
+        prog > 0 ? `${sp.levels[sp.cur]}：そのまま静止…` : `${sp.levels[sp.cur]} に当てて静止してください`;
+      if (auto && prog >= 1) recordValue(current(1000));
+    }
+  }
   requestAnimationFrame(loop);
 })(0);
 $('#sStart').onclick = async () => {
@@ -422,20 +463,18 @@ $('#sCal').onclick = () => {
   if (!sen.g) return toast('先にセンサーを開始してください');
   sen.cal.sy = sen.g.y >= 0 ? 1 : -1;
   const r = rawAngles(sen.g); sen.cal.os = r.s; sen.cal.of = r.f; sen.buf = [];
+  au.armed = false; au.last = 0;
   ls.set('cal', sen.cal); beep(); toast('0°に校正しました');
 };
 $('#sFlip').onclick = () => {
   if (spPlane() === 'sag') { sen.cal.sz *= -1; sen.cal.os *= -1; } else { sen.cal.sx *= -1; sen.cal.of *= -1; }
-  sen.buf = []; ls.set('cal', sen.cal); toast('＋−を反転しました');
+  sen.buf = []; au.armed = false; ls.set('cal', sen.cal); toast('＋−を反転しました');
 };
 $('#sRec').onclick = () => {
-  const c = current();
-  if (!c) return toast('センサー未開始です（計測点のタップで手入力も可）');
-  if (c.sd > 1.5) toast('ブレがあります。必要なら再記録してください');
-  sp.vals[sp.cur] = Math.round(c.v * 10) / 10; beep();
-  const nx = sp.vals.findIndex((v, i) => i > sp.cur && v == null);
-  sp.cur = nx >= 0 ? nx : Math.min(sp.cur + 1, sp.levels.length - 1);
-  renderSpine();
+  if (!sen.got) return toast('センサー未開始です（計測点のタップで手入力も可）');
+  const btn = $('#sRec'); btn.disabled = true; btn.textContent = '静止してください…';
+  // ボタンを押した瞬間の揺れを避け、少し待ってから平均する
+  setTimeout(() => { btn.disabled = false; recordValue(current(800)); }, 700);
 };
 $('#sSave').onclick = async () => {
   const len = +$('#sLen').value || 50, plane = spPlane();
